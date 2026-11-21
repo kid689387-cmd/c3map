@@ -58,6 +58,10 @@
       <button id="mInv">กลับสี</button>
     </div>
     <div class="row" style="margin-top:8px">
+      <button id="tName" class="on">ชื่อถนนภาษาไทย</button>
+      <button id="tLabels">ป้ายบนแผนที่ OLED</button>
+    </div>
+    <div class="row" style="margin-top:8px">
       <label for="sens">ความไว</label>
       <input type="range" id="sens" min="1" max="100" value="70">
     </div>
@@ -82,6 +86,50 @@
   let pos = { lat: 13.7563, lon: 100.5018, speed: null };
   let zoom = 16, mode = 'edges', inv = false, sens = 70;
   let gpsWatch = null, wakeLock = null, busy = false, pending = false;
+  let showName = true, placeName = '', lastGeo = null;
+  let tileSrc = 'carto';   // carto = แผนที่ไม่มีป้าย (เส้นถนนคมกว่าบน OLED), osm = มีป้ายชื่อ
+  const TILE_URL = {
+    carto: k => `https://a.basemaps.cartocdn.com/light_nolabels/${k}.png`,
+    osm:   k => `https://tile.openstreetmap.org/${k}.png`
+  };
+
+  // ---------- ชื่อถนน/ย่าน ภาษาไทย (OSM Nominatim) ----------
+  function distM(a, b) {
+    return Math.hypot((a.lat - b.lat) * 111000, (a.lon - b.lon) * 111000 * Math.cos(a.lat * Math.PI / 180));
+  }
+  async function geocode() {
+    if (!showName) return;
+    const now = Date.now();
+    if (lastGeo && (now - lastGeo.t < 8000 || distM(lastGeo, pos) < 40)) return;
+    lastGeo = { lat: pos.lat, lon: pos.lon, t: now };
+    try {
+      const r = await fetch(`https://nominatim.openstreetmap.org/reverse?format=jsonv2&zoom=17&accept-language=th&lat=${pos.lat}&lon=${pos.lon}`);
+      const j = await r.json(), a = j.address || {};
+      placeName = a.road || a.neighbourhood || a.quarter || a.suburb || a.village || a.town || a.city || j.name || '';
+      update();
+    } catch (e) { /* ไม่มีเน็ตก็แสดงต่อได้ */ }
+  }
+
+  // วาดข้อความไทยลงแถบล่าง 16 แถวของจอ (เบราว์เซอร์จัดสระ/วรรณยุกต์ให้)
+  const tcan = document.createElement('canvas');
+  tcan.width = W; tcan.height = 16;
+  const tctx = tcan.getContext('2d', { willReadFrequently: true });
+  function overlayText(bits) {
+    if (!showName) return;
+    const font = 'bold 13px "Noto Sans Thai", "Sarabun", sans-serif';
+    tctx.fillStyle = '#000'; tctx.fillRect(0, 0, W, 16);
+    tctx.font = font; tctx.fillStyle = '#fff'; tctx.textBaseline = 'alphabetic';
+    const spd = pos.speed != null ? Math.round(pos.speed * 3.6) + 'กม/ชม' : '';
+    const spdW = spd ? tctx.measureText(spd).width + 4 : 0;
+    let txt = placeName || 'กำลังหาชื่อถนน…';
+    while (txt.length > 1 && tctx.measureText(txt).width > W - 2 - spdW) txt = txt.slice(0, -2) + '…';
+    tctx.fillText(txt, 1, 12);
+    if (spd) tctx.fillText(spd, W - spdW + 3, 12);
+    const d = tctx.getImageData(0, 0, W, 16).data;
+    for (let y = 0; y < 16; y++) for (let x = 0; x < W; x++)
+      bits[(48 + y) * W + x] = d[(y * W + x) * 4] > 110 ? 1 : 0;
+    for (let x = 0; x < W; x++) bits[47 * W + x] = 0;   // เส้นคั่นดำ
+  }
 
   // ---------- ตรวจความพร้อมของเบราว์เซอร์ ----------
   const warns = [];
@@ -108,16 +156,16 @@
     const n = 2 ** z;
     if (y < 0 || y >= n) return Promise.resolve(null);
     x = ((x % n) + n) % n;
-    const k = `${z}/${x}/${y}`;
-    if (tiles.has(k)) return tiles.get(k);
+    const k = `${z}/${x}/${y}`, key = tileSrc + '/' + k;
+    if (tiles.has(key)) return tiles.get(key);
     const p = new Promise(res => {
       const img = new Image();
       img.crossOrigin = 'anonymous';
       img.onload = () => res(img);
       img.onerror = () => res(null);
-      img.src = `https://tile.openstreetmap.org/${k}.png`;
+      img.src = TILE_URL[tileSrc](k);
     });
-    tiles.set(k, p);
+    tiles.set(key, p);
     if (tiles.size > 150) tiles.delete(tiles.keys().next().value);
     return p;
   }
@@ -137,10 +185,15 @@
     wctx.fillStyle = '#fff';
     wctx.fillRect(0, 0, W + 2, H + 2);
     const jobs = [];
+    let loaded = 0;
     for (let ty = Math.floor(y0 / 256); ty <= Math.floor((y0 + H + 1) / 256); ty++)
       for (let tx = Math.floor(x0 / 256); tx <= Math.floor((x0 + W + 1) / 256); tx++)
-        jobs.push(getTile(zoom, tx, ty).then(img => { if (img) wctx.drawImage(img, tx * 256 - x0, ty * 256 - y0); }));
+        jobs.push(getTile(zoom, tx, ty).then(img => { if (img) { loaded++; wctx.drawImage(img, tx * 256 - x0, ty * 256 - y0); } }));
     await Promise.all(jobs);
+    if (!loaded && tileSrc === 'carto') {          // โหลดแผนที่ไม่มีป้ายไม่ได้ -> ใช้ OSM แทน
+      tileSrc = 'osm'; $('tLabels').classList.add('on');
+      return render();
+    }
 
     let d;
     try { d = wctx.getImageData(0, 0, W + 2, H + 2).data; }
@@ -159,6 +212,7 @@
       if (inv) on = !on;
       bits[y * W + x] = on ? 1 : 0;
     }
+    overlayText(bits);
     return bits;
   }
 
@@ -202,13 +256,16 @@
         throw e;
       }
     }
-    await write(new Uint8Array([2, ...new TextEncoder().encode(statusText())]));
+    // เปิดชื่อไทย: ล้างแถบสถานะอังกฤษของ ESP32 / ปิด: ส่งพิกัดแบบเดิม
+    const st = showName ? '' : statusText();
+    await write(new Uint8Array([2, ...new TextEncoder().encode(st)]));
   }
 
   async function update() {
     if (busy) { pending = true; return; }
     busy = true;
     try {
+      geocode();
       do {
         pending = false;
         const bits = await render();
@@ -264,6 +321,11 @@
   $('mEdges').onclick = () => { mode = 'edges'; $('mEdges').classList.add('on'); $('mDark').classList.remove('on'); update(); };
   $('mDark').onclick = () => { mode = 'dark'; $('mDark').classList.add('on'); $('mEdges').classList.remove('on'); update(); };
   $('mInv').onclick = () => { inv = !inv; $('mInv').classList.toggle('on', inv); update(); };
+  $('tName').onclick = () => { showName = !showName; $('tName').classList.toggle('on', showName); update(); };
+  $('tLabels').onclick = () => {
+    tileSrc = tileSrc === 'osm' ? 'carto' : 'osm';
+    $('tLabels').classList.toggle('on', tileSrc === 'osm'); update();
+  };
   $('sens').oninput = e => { sens = +e.target.value; update(); };
 
   update();
