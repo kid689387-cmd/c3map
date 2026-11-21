@@ -155,7 +155,7 @@
   let dest = null, route = null, navOn = false, profile = 'car', vias = [];
   let navState = null, offCount = 0, lastReroute = 0, routing = false;
   let simTimer = null, simAlong = 0;
-  let scrollX = 0, scrollKey = '', needScroll = false;
+  let scrollX = 0, scrollKey = '', needScroll = false, lastSent = 0;
   let spokenStep = -1, spokenNear = -1;
 
   // ---------------- ตรวจเบราว์เซอร์ ----------------
@@ -844,7 +844,7 @@
         pending = false;
         const bits = await render();
         preview(bits);
-        if (ch) await sendFrame(pack(bits));
+        if (ch) { await sendFrame(pack(bits)); lastSent = Date.now(); }
       } while (pending);
     } catch (e) {
       msg('ส่งข้อมูลผิดพลาด: ' + e.message);
@@ -868,6 +868,7 @@
       chunk = 180;
       await write(new Uint8Array([3, 0]));   // มือถือวาดตำแหน่งเอง
       await write(new Uint8Array([2]));      // ล้างแถบสถานะของ ESP32
+      await sendFontSize();
       $('dotBle').classList.add('ok');
       msg('เชื่อมกับ ' + dev.name + ' แล้ว');
       update();
@@ -911,7 +912,20 @@
   $('sMap').onclick = () => setScreen('map');
   $('sArrow').onclick = () => setScreen('arrow');
 
-  $('fs').oninput = e => { fontSize = +e.target.value; $('fsLbl').textContent = fontSize; try { localStorage.setItem('c3fs', fontSize); } catch (x) {} update(); };
+  // ขนาดตัวอักษรของโหมด Google Maps (บอร์ดจำค่าไว้เอง): 10-12 เล็ก, 13-16 กลาง, 17+ ใหญ่
+  async function sendFontSize() {
+    if (!ch) return;
+    try { await write(new Uint8Array([4, fontSize <= 12 ? 0 : fontSize <= 16 ? 1 : 2])); } catch (e) {}
+  }
+  let fsTimer = null;
+  $('fs').oninput = e => {
+    fontSize = +e.target.value; $('fsLbl').textContent = fontSize;
+    try { localStorage.setItem('c3fs', fontSize); } catch (x) {}
+    clearTimeout(fsTimer); fsTimer = setTimeout(sendFontSize, 400);
+    update();
+  };
+  // ส่งภาพซ้ำทุก 3 วินาที ให้บอร์ดรู้ว่าหน้าเว็บยังเชื่อมอยู่
+  setInterval(() => { if (ch && !busy && Date.now() - lastSent > 3000) update(); }, 1000);
   try { const v = +localStorage.getItem('c3fs'); if (v >= 10 && v <= 22) { fontSize = v; $('fs').value = v; $('fsLbl').textContent = v; } } catch (x) {}
 
   $('tName').onclick = () => { showText = !showText; $('tName').classList.toggle('on', showText); update(); };
