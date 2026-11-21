@@ -27,6 +27,10 @@
 #define SVC_UUID "c3a40001-7b2d-4e8a-9d61-6d6170633301"
 #define RX_UUID  "c3a40002-7b2d-4e8a-9d61-6d6170633301"
 
+// ต้องประกาศไว้บนสุด (Arduino สร้าง prototype ของฟังก์ชันไว้ก่อนโค้ดอื่น)
+enum Turn { T_STRAIGHT, T_RIGHT, T_LEFT, T_SRIGHT, T_SLEFT, T_UTURN, T_ROUND, T_ARRIVE };
+struct Scroller { uint32_t hash = 0, start = 0; };
+
 U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE, PIN_SCL, PIN_SDA);
 ChronosESP32 watch(DEVICE_NAME);
 Preferences prefs;
@@ -94,7 +98,6 @@ static int thaiWidth(const char *s, uint8_t fi) { return thaiText(0, 0, s, fi, f
 static int lineH(uint8_t fi) { return TFONTS[fi].bot - TFONTS[fi].top; }
 
 // กล่องข้อความ: ถ้ายาวเกินจะเลื่อนแบบตัววิ่ง
-struct Scroller { uint32_t hash = 0, start = 0; };
 static uint32_t strHash(const char *s) { uint32_t h = 5381; while (*s) h = h * 33 + (uint8_t)*s++; return h; }
 
 static void textBox(int x0, int y0, int w, int h, const char *s, uint8_t fi, Scroller &sc, bool center = false) {
@@ -193,7 +196,6 @@ static void drawMarker(bool blink) {
 }
 
 // ---- ลูกศรสำรอง (เมื่อไอคอนจาก Google ว่าง) วาดจากคำในข้อความ ----
-enum Turn { T_STRAIGHT, T_RIGHT, T_LEFT, T_SRIGHT, T_SLEFT, T_UTURN, T_ROUND, T_ARRIVE };
 static bool has(const String &s, const char *k) { return s.indexOf(k) >= 0; }
 static Turn guessTurn(const String &t) {
   if (has(t, "กลับรถ") || has(t, "U-turn") || has(t, "u-turn")) return T_UTURN;
