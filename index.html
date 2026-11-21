@@ -60,7 +60,7 @@
   <div class="card">
     <h2>จุดหมาย</h2>
     <form class="row" id="searchForm">
-      <input type="search" id="q" placeholder="ค้นหาสถานที่ เช่น เซ็นทรัล ลาดพร้าว" autocomplete="off">
+      <input type="search" id="q" placeholder="ค้นหาสถานที่ หรือวางลิงก์ Google Maps" autocomplete="off">
       <button type="submit" style="flex:0 0 auto">ค้นหา</button>
     </form>
     <div id="results"></div>
@@ -212,6 +212,11 @@
     ev.preventDefault();
     const q = $('q').value.trim();
     if (!q) return;
+    // วางลิงก์หรือพิกัดในช่องค้นหาก็ได้
+    if (/https?:\/\/|geo:/.test(q) || /^-?\d{1,2}\.\d{3,}\s*[, ]\s*-?\d{1,3}\.\d{3,}$/.test(q)) {
+      $('shareTxt').value = q; $('q').value = ''; $('results').innerHTML = '';
+      return useShared();
+    }
     $('results').innerHTML = '<small>กำลังค้นหา…</small>';
     const vb = [pos.lon - 0.6, pos.lat + 0.6, pos.lon + 0.6, pos.lat - 0.6].join(',');
     try {
@@ -247,7 +252,7 @@
     const dirPts = [...t.matchAll(new RegExp('!1d' + NUM + '!2d' + NUM, 'g'))].map(m => okLL(m[2], m[1])).filter(Boolean);
     const dirPath = t.match(/\/maps\/dir\/([^?@]+)/);
     if (dirPath) {
-      const segs = dirPath[1].split('/').filter(s => s.trim());
+      const segs = dirPath[1].split('/').filter(s => s.trim() && !s.startsWith('data='));
       const segPts = segs.map(s => { const m = s.match(new RegExp('^\\s*' + NUM + '\\s*,\\s*' + NUM)); return m ? okLL(m[1], m[2]) : { name: s.trim() }; });
       if (dirPts.length >= segs.length) res.points = dirPts;          // พิกัดครบจาก data
       else {
@@ -279,6 +284,49 @@
     return res;
   }
 
+  // ---------------- แปลงลิงก์สั้น maps.app.goo.gl ผ่านตัวกลาง (CORS proxy) ----------------
+  function unescapeGoogle(s) {
+    s = s.replace(/\\u003d/gi, '=').replace(/\\u0026/gi, '&').replace(/\\u002f/gi, '/').replace(/&amp;/g, '&').replace(/\\\//g, '/');
+    try { s = decodeURIComponent(s); } catch (e) { s = s.replace(/%2C/gi, ',').replace(/%3D/gi, '=').replace(/%2F/gi, '/'); }
+    return s;
+  }
+  function extractFromPage(text) {   // หาพิกัดในหน้าเว็บ/URL ที่ได้จากการเปิดลิงก์สั้น
+    const t = unescapeGoogle(text);
+    // ลิงก์เส้นทาง หรือ consent page ที่มี continue=<URL เต็ม>
+    const full = t.match(/https:\/\/www\.google\.[a-z.]+\/maps\/(?:dir|place|search)\/[^\s"'<>\\]+/);
+    if (full) { const p = parseShared(full[0]); if (p.points.length) return p; }
+    let m;
+    if ((m = t.match(new RegExp('!3d' + NUM + '!4d' + NUM)))) return { points: [okLL(m[1], m[2])] };
+    if ((m = t.match(new RegExp('[?&](?:q|query|ll|daddr|destination)=' + NUM + ',\\s*' + NUM)))) return { points: [okLL(m[1], m[2])] };
+    if ((m = t.match(new RegExp('(?:markers|center)=' + NUM + ',' + NUM)))) return { points: [okLL(m[1], m[2])] };
+    if ((m = t.match(new RegExp('APP_INITIALIZATION_STATE=\\[\\[\\[[\\d.]+,' + NUM + ',' + NUM)))) return { points: [okLL(m[2], m[1])] };
+    if ((m = t.match(new RegExp('/@' + NUM + ',' + NUM)))) return { points: [okLL(m[1], m[2])] };
+    return { points: [] };
+  }
+  async function fetchT(url, ms = 9000) {
+    const ac = new AbortController(), tm = setTimeout(() => ac.abort(), ms);
+    try { const r = await fetch(url, { signal: ac.signal }); return r.ok ? await r.text() : ''; }
+    finally { clearTimeout(tm); }
+  }
+  async function resolveShortLink(link) {
+    const enc = encodeURIComponent(link);
+    const tries = [
+      async () => { const j = JSON.parse(await fetchT(`https://api.allorigins.win/get?url=${enc}`)); return (j.status && j.status.url || '') + '\n' + (j.contents || ''); },
+      () => fetchT(`https://api.codetabs.com/v1/proxy?quest=${enc}`),
+      () => fetchT(`https://corsproxy.io/?url=${enc}`),
+      () => fetchT(`https://api.allorigins.win/raw?url=${enc}`),
+    ];
+    for (const f of tries) {
+      try {
+        const txt = await f();
+        if (!txt) continue;
+        const p = extractFromPage(txt);
+        if (p.points.length) return p;
+      } catch (e) { /* ลองตัวถัดไป */ }
+    }
+    return null;
+  }
+
   async function geocodeName(name) {
     const vb = [pos.lon - 1, pos.lat + 1, pos.lon + 1, pos.lat - 1].join(',');
     const r = await fetch(`https://nominatim.openstreetmap.org/search?format=jsonv2&limit=1&accept-language=th&countrycodes=th&viewbox=${vb}&q=${encodeURIComponent(name)}`);
@@ -289,18 +337,26 @@
   async function useShared() {
     const raw = $('shareTxt').value;
     if (!raw.trim()) { msg('ยังไม่ได้วางลิงก์'); return; }
-    const p = parseShared(raw);
+    let p = parseShared(raw);
     try {
+      // ลิงก์สั้นไม่มีพิกัด -> เปิดลิงก์ผ่านตัวกลางเพื่อหาพิกัดจริง
+      const short = raw.match(/https?:\/\/(?:maps\.app\.goo\.gl|goo\.gl\/maps)\/[A-Za-z0-9_-]+/);
+      if (!p.points.length && short) {
+        msg('กำลังแปลงลิงก์สั้นเป็นพิกัด…');
+        const r = await resolveShortLink(short[0]);
+        if (r) p = { ...p, points: r.points };
+      }
       // แปลงจุดที่เป็นชื่อให้เป็นพิกัด
       const pts = [];
-      for (const it of p.points) {
+      for (const [i, it] of p.points.entries()) {
         if (!it) continue;
+        if (i === 0 && p.points.length >= 2) { pts.push(it.name ? pos : it); continue; }   // จุดแรก = ต้นทาง (ไม่ต้องค้นชื่อ)
         if (it.name) { const g = await geocodeName(it.name); if (g) pts.push(g); }
         else pts.push(it);
       }
       if (!pts.length && p.name) { const g = await geocodeName(p.name); if (g) pts.push(g); }
       if (!pts.length) {
-        msg(p.shortLink ? 'ลิงก์สั้นไม่มีพิกัด — แตะค้างที่จุดหมายใน Google Maps แล้วคัดลอกพิกัดมาวาง' : 'อ่านพิกัดจากลิงก์ไม่ได้');
+        msg(p.shortLink ? 'แปลงลิงก์สั้นไม่สำเร็จ — ลองใหม่ หรือแตะค้างที่จุดหมายใน Google Maps แล้วคัดลอกพิกัดมาวาง' : 'อ่านพิกัดจากลิงก์ไม่ได้');
         $('shareBox').open = true;
         return;
       }
@@ -309,7 +365,9 @@
       const via = pts.length >= 3 ? pts.slice(1, -1) : [];
       $('shareTxt').value = '';
       $('shareBox').open = false;
-      await setDest(d.lat, d.lon, d.name || null, via);
+      await setDest(d.lat, d.lon, d.name || p.name || null, via);
+      $('dest').textContent += ` · ${d.lat.toFixed(5)}, ${d.lon.toFixed(5)}`;
+      if (route && !navOn) startNav();          // ได้เส้นทางแล้ว เริ่มนำทางทันที
     } catch (e) { msg('อ่านลิงก์ไม่สำเร็จ (ตรวจอินเทอร์เน็ต)'); }
   }
   $('btnShare').onclick = useShared;
