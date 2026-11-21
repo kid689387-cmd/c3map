@@ -64,6 +64,18 @@
       <button type="submit" style="flex:0 0 auto">ค้นหา</button>
     </form>
     <div id="results"></div>
+    <details id="shareBox" style="margin-top:10px">
+      <summary style="min-height:40px;display:flex;align-items:center;color:var(--acc)">หาไม่เจอ? วางลิงก์ที่แชร์จาก Google Maps</summary>
+      <textarea id="shareTxt" rows="3" placeholder="วางลิงก์ / ข้อความที่แชร์ / พิกัด เช่น 13.7563, 100.5018" style="width:100%;margin-top:6px;border-radius:10px;border:1px solid #33465c;background:#0d141c;color:var(--ink);font-size:16px;padding:10px"></textarea>
+      <div class="row" style="margin-top:6px">
+        <button id="btnPaste">วางจากคลิปบอร์ด</button>
+        <button id="btnShare" class="on">ใช้ลิงก์นี้</button>
+      </div>
+      <small id="shareHelp" style="color:var(--mute);display:block;margin-top:6px;line-height:1.5">
+        ถ้าเป็นลิงก์สั้นแบบ maps.app.goo.gl ระบบจะค้นจากชื่อสถานที่ในข้อความที่แชร์มาให้แทน
+        ถ้ายังไม่เจอ: ใน Google Maps ให้<b>แตะค้างที่จุดหมาย</b> แล้วคัดลอกพิกัดที่ขึ้นในช่องค้นหามาวางที่นี่
+      </small>
+    </details>
     <div id="dest">ยังไม่ได้เลือก — ค้นหา หรือแตะบนแผนที่ด้านล่าง</div>
     <div class="row" style="margin-top:8px">
       <button id="pCar" class="on">รถยนต์/มอไซค์</button>
@@ -140,7 +152,7 @@
   let fontSize = 13, screen = 'map', showText = true, voice = false;
   let gpsWatch = null, wakeLock = null, busy = false, pending = false;
   let placeName = '', lastGeo = null;
-  let dest = null, route = null, navOn = false, profile = 'car';
+  let dest = null, route = null, navOn = false, profile = 'car', vias = [];
   let navState = null, offCount = 0, lastReroute = 0, routing = false;
   let simTimer = null, simAlong = 0;
   let scrollX = 0, scrollKey = '', needScroll = false;
@@ -219,17 +231,105 @@
     } catch (e) { $('results').innerHTML = '<small>ค้นหาไม่สำเร็จ (ตรวจอินเทอร์เน็ต)</small>'; }
   };
 
-  async function setDest(lat, lon, name) {
+  // ---------------- ลิงก์ที่แชร์จาก Google Maps / แอปแผนที่ ----------------
+  const NUM = '(-?\\d{1,3}\\.\\d+)';
+  function okLL(lat, lon) {
+    lat = +lat; lon = +lon;
+    if (Math.abs(lat) > 90 && Math.abs(lon) <= 90) [lat, lon] = [lon, lat];
+    return Math.abs(lat) <= 90 && Math.abs(lon) <= 180 && !(lat === 0 && lon === 0) ? { lat, lon } : null;
+  }
+  function parseShared(raw) {
+    let t = raw.trim();
+    try { t = decodeURIComponent(t.replace(/\+/g, ' ')); } catch (e) {}
+    const res = { points: [], name: null, shortLink: /maps\.app\.goo\.gl|goo\.gl\/maps/.test(t) };
+
+    // 1) ลิงก์เส้นทาง /maps/dir/ : จุดใน data=!1d<lon>!2d<lat> และในเส้นทาง URL
+    const dirPts = [...t.matchAll(new RegExp('!1d' + NUM + '!2d' + NUM, 'g'))].map(m => okLL(m[2], m[1])).filter(Boolean);
+    const dirPath = t.match(/\/maps\/dir\/([^?@]+)/);
+    if (dirPath) {
+      const segs = dirPath[1].split('/').filter(s => s.trim());
+      const segPts = segs.map(s => { const m = s.match(new RegExp('^\\s*' + NUM + '\\s*,\\s*' + NUM)); return m ? okLL(m[1], m[2]) : { name: s.trim() }; });
+      if (dirPts.length >= segs.length) res.points = dirPts;          // พิกัดครบจาก data
+      else {
+        let k = dirPts.length - 1;                                    // เติมพิกัดจาก data ให้ชื่อที่อยู่ท้าย ๆ
+        for (let i = segPts.length - 1; i >= 0; i--) if (segPts[i].name && k >= 0) segPts[i] = dirPts[k--];
+        res.points = segPts;
+      }
+      return res;
+    }
+    // 2) ลิงก์สถานที่ !3d<lat>!4d<lon>
+    let m = t.match(new RegExp('!3d' + NUM + '!4d' + NUM));
+    if (m) { res.points = [okLL(m[1], m[2])]; return res; }
+    // 3) พารามิเตอร์ q= / destination= / daddr= / ll= / query=
+    m = t.match(new RegExp('[?&](?:q|query|destination|daddr|ll|sll)=(?:loc:)?' + NUM + '\\s*,\\s*' + NUM));
+    if (m) { res.points = [okLL(m[1], m[2])]; return res; }
+    // 4) geo: URI, OpenStreetMap
+    m = t.match(new RegExp('geo:' + NUM + ',' + NUM)) || t.match(new RegExp('mlat=' + NUM + '&mlon=' + NUM)) || t.match(new RegExp('#map=\\d+/' + NUM + '/' + NUM));
+    if (m) { res.points = [okLL(m[1], m[2])]; return res; }
+    // 5) พิกัดล้วน "13.7563, 100.5018"
+    m = t.match(/(-?\d{1,2}\.\d{3,})\s*[, ]\s*(-?\d{1,3}\.\d{3,})/);
+    if (m) { res.points = [okLL(m[1], m[2])]; return res; }
+    // 6) จุดกลางแผนที่ @lat,lon (แม่นน้อยกว่า)
+    m = t.match(new RegExp('@' + NUM + ',' + NUM));
+    if (m) { res.points = [okLL(m[1], m[2])]; return res; }
+    // 7) ไม่มีพิกัด: ใช้ชื่อสถานที่ในข้อความ (บรรทัดที่ไม่ใช่ลิงก์) หรือ /place/<ชื่อ>
+    const place = t.match(/\/maps\/place\/([^/@?]+)/);
+    const lines = t.split(/\n/).map(s => s.replace(/https?:\/\/\S+/g, '').trim()).filter(s => s.length > 1);
+    res.name = place ? place[1].trim() : (lines[0] || null);
+    return res;
+  }
+
+  async function geocodeName(name) {
+    const vb = [pos.lon - 1, pos.lat + 1, pos.lon + 1, pos.lat - 1].join(',');
+    const r = await fetch(`https://nominatim.openstreetmap.org/search?format=jsonv2&limit=1&accept-language=th&countrycodes=th&viewbox=${vb}&q=${encodeURIComponent(name)}`);
+    const j = await r.json();
+    return j.length ? { lat: +j[0].lat, lon: +j[0].lon, name: j[0].name || name } : null;
+  }
+
+  async function useShared() {
+    const raw = $('shareTxt').value;
+    if (!raw.trim()) { msg('ยังไม่ได้วางลิงก์'); return; }
+    const p = parseShared(raw);
+    try {
+      // แปลงจุดที่เป็นชื่อให้เป็นพิกัด
+      const pts = [];
+      for (const it of p.points) {
+        if (!it) continue;
+        if (it.name) { const g = await geocodeName(it.name); if (g) pts.push(g); }
+        else pts.push(it);
+      }
+      if (!pts.length && p.name) { const g = await geocodeName(p.name); if (g) pts.push(g); }
+      if (!pts.length) {
+        msg(p.shortLink ? 'ลิงก์สั้นไม่มีพิกัด — แตะค้างที่จุดหมายใน Google Maps แล้วคัดลอกพิกัดมาวาง' : 'อ่านพิกัดจากลิงก์ไม่ได้');
+        $('shareBox').open = true;
+        return;
+      }
+      // ลิงก์เส้นทาง: จุดแรกคือต้นทาง (ใช้ตำแหน่งจริงแทน) ถ้ามีมากกว่า 2 จุด จุดกลางคือจุดแวะ
+      const d = pts[pts.length - 1];
+      const via = pts.length >= 3 ? pts.slice(1, -1) : [];
+      $('shareTxt').value = '';
+      $('shareBox').open = false;
+      await setDest(d.lat, d.lon, d.name || null, via);
+    } catch (e) { msg('อ่านลิงก์ไม่สำเร็จ (ตรวจอินเทอร์เน็ต)'); }
+  }
+  $('btnShare').onclick = useShared;
+  $('btnPaste').onclick = async () => {
+    try { $('shareTxt').value = await navigator.clipboard.readText(); useShared(); }
+    catch (e) { msg('อ่านคลิปบอร์ดไม่ได้ — กดค้างในช่องแล้วเลือก "วาง" แทน'); $('shareTxt').focus(); }
+  };
+
+  async function setDest(lat, lon, name, viaList = []) {
+    vias = viaList;
     dest = { lat, lon, name: name || 'จุดที่เลือก' };
     if (destMarker) destMarker.remove();
     destMarker = L.marker([lat, lon]).addTo(map);
-    $('dest').textContent = 'จุดหมาย: ' + dest.name;
+    $('dest').textContent = 'จุดหมาย: ' + dest.name + (vias.length ? ` (แวะ ${vias.length} จุด)` : '');
     if (!name) {
       try {
         const r = await fetch(`https://nominatim.openstreetmap.org/reverse?format=jsonv2&zoom=18&accept-language=th&lat=${lat}&lon=${lon}`);
         const j = await r.json();
         dest.name = j.name || (j.address && (j.address.road || j.address.suburb)) || dest.name;
-        $('dest').textContent = 'จุดหมาย: ' + dest.name;
+        $('dest').textContent = 'จุดหมาย: ' + dest.name + (vias.length ? ` (แวะ ${vias.length} จุด)` : '');
       } catch (e) {}
     }
     await fetchRoute(true);
@@ -241,7 +341,7 @@
     if (!dest || routing) return;
     routing = true;
     msg('กำลังคำนวณเส้นทาง…');
-    const coords = `${pos.lon},${pos.lat};${dest.lon},${dest.lat}`;
+    const coords = [pos, ...vias, dest].map(p => `${p.lon},${p.lat}`).join(';');
     const q = '?overview=full&geometries=geojson&steps=true';
     const urls = [`https://routing.openstreetmap.de/${PROFILES[profile]}/route/v1/driving/${coords}${q}`];
     if (profile === 'car') urls.push(`https://router.project-osrm.org/route/v1/driving/${coords}${q}`);
@@ -269,10 +369,15 @@
     for (let i = 1; i < pts.length; i++) cum.push(cum[i - 1] + distM(pts[i - 1], pts[i]));
     const steps = [];
     let along = 0;
-    for (const s of r.legs[0].steps) {
-      steps.push({ along, m: s.maneuver, name: s.name || s.ref || '', text: thaiStep(s) });
-      along += s.distance;
-    }
+    r.legs.forEach((leg, li) => {
+      const last = li === r.legs.length - 1;
+      for (const s of leg.steps) {
+        if (s.maneuver.type === 'depart' && li > 0) continue;               // ไม่ต้องบอก "ออกเดินทาง" ซ้ำหลังจุดแวะ
+        const isVia = s.maneuver.type === 'arrive' && !last;
+        steps.push({ along, m: s.maneuver, name: s.name || s.ref || '', text: isVia ? `ผ่านจุดแวะที่ ${li + 1}` : thaiStep(s) });
+        along += s.distance;
+      }
+    });
     route = { pts, cum, geomLen: cum[cum.length - 1] || 1, steps, total: r.distance, duration: r.duration };
   }
 
@@ -338,6 +443,8 @@
     };
 
     if (navOn) {
+      // ผ่านจุดแวะแล้ว -> ตัดออก (จะได้ไม่วนกลับเมื่อคำนวณใหม่)
+      if (vias.length && distM(pos, vias[0]) < 40) vias.shift();
       // หลุดเส้นทาง -> คำนวณใหม่
       if (s.d > 45 && !simTimer) offCount++; else offCount = 0;
       if (offCount >= 3 && Date.now() - lastReroute > 15000) {
