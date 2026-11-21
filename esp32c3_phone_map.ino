@@ -13,6 +13,7 @@
   โปรโตคอล (โทรศัพท์ -> ESP32, เขียนลง characteristic RX):
     [0x01, offHi, offLo, data...]  = ชิ้นส่วนเฟรม 1024 ไบต์ (รูปแบบบัฟเฟอร์ U8g2 ตรง ๆ)
     [0x02, ascii...]               = ข้อความแถบสถานะด้านล่าง
+    [0x03, flags]                  = bit0: 1 = ESP32 วาดจุดกลางจอ, 0 = ไม่วาด (มือถือวาดเอง)
 */
 #include <U8g2lib.h>
 #include <BLEDevice.h>
@@ -190,11 +191,12 @@ static uint8_t frontBuf[1024];
 static char statusTxt[32] = "";
 static volatile bool frameReady = false;
 static volatile bool connected = false;
+static volatile bool showMarker = true;
 static portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
 
 class ServerCB : public BLEServerCallbacks {
   void onConnect(BLEServer *s) override { connected = true; }
-  void onDisconnect(BLEServer *s) override { connected = false; }
+  void onDisconnect(BLEServer *s) override { connected = false; showMarker = true; }
 };
 
 class RxCB : public BLECharacteristicCallbacks {
@@ -215,6 +217,8 @@ class RxCB : public BLECharacteristicCallbacks {
         frameReady = true;
         portEXIT_CRITICAL(&mux);
       }
+    } else if (d[0] == 0x03 && n >= 2) {          // ตั้งค่า
+      showMarker = d[1] & 0x01;
     } else if (d[0] == 0x02) {                    // ข้อความสถานะ
       size_t len = n - 1;
       if (len > sizeof(statusTxt) - 1) len = sizeof(statusTxt) - 1;
@@ -295,7 +299,7 @@ void loop() {
   u8g2.clearBuffer();
   if (haveFrame) {
     memcpy(u8g2.getBufferPtr(), view, 1024);
-    drawMarker((millis() / 400) % 2);
+    if (showMarker) drawMarker((millis() / 400) % 2);
     if (connected) drawStatus(st);
     else {
       u8g2.setDrawColor(0); u8g2.drawBox(0, 47, 128, 17); u8g2.setDrawColor(1);
