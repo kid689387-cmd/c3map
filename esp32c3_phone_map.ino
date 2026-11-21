@@ -164,13 +164,16 @@ static uint32_t iconCrc = 0;
 static uint8_t iconXbm[288];
 static bool iconOk = false;
 
+static volatile bool iconDirty = false;
 void onConfig(Config config, uint32_t a, uint32_t b) {
-  if (config == CF_NAV_DATA) navActive = a != 0;
+  if (config == CF_NAV_DATA) { navActive = a != 0; iconDirty = true; }
+  if (config == CF_NAV_ICON) iconDirty = true;       // ไอคอนมาเป็นชิ้น ๆ: อัปเดตทุกครั้งที่ได้ชิ้นใหม่
 }
 
 static void refreshIcon(Navigation &nav) {   // แปลงไอคอน 48x48 (MSB ซ้าย) เป็น XBM (LSB ซ้าย)
   if (!nav.hasIcon) { iconOk = false; return; }
-  if (iconOk && nav.iconCRC == iconCrc) return;
+  if (iconOk && !iconDirty && nav.iconCRC == iconCrc) return;
+  iconDirty = false;
   for (int i = 0; i < 288; i++) {
     uint8_t v = nav.icon[i], r = 0;
     for (int k = 0; k < 8; k++) if (v & (1 << k)) r |= 0x80 >> k;
@@ -189,10 +192,89 @@ static void drawMarker(bool blink) {
   if (blink) u8g2.drawDisc(64, 32, 2);
 }
 
+// ---- ลูกศรสำรอง (เมื่อไอคอนจาก Google ว่าง) วาดจากคำในข้อความ ----
+enum Turn { T_STRAIGHT, T_RIGHT, T_LEFT, T_SRIGHT, T_SLEFT, T_UTURN, T_ROUND, T_ARRIVE };
+static bool has(const String &s, const char *k) { return s.indexOf(k) >= 0; }
+static Turn guessTurn(const String &t) {
+  if (has(t, "กลับรถ") || has(t, "U-turn") || has(t, "u-turn")) return T_UTURN;
+  if (has(t, "วงเวียน") || has(t, "oundabout")) return T_ROUND;
+  if (has(t, "จุดหมาย") || has(t, "estination")) return T_ARRIVE;
+  if (has(t, "ชิดขวา") || has(t, "เบี่ยงขวา") || has(t, "eep right") || has(t, "light right")) return T_SRIGHT;
+  if (has(t, "ชิดซ้าย") || has(t, "เบี่ยงซ้าย") || has(t, "eep left") || has(t, "light left")) return T_SLEFT;
+  if (has(t, "ขวา") || has(t, "right") || has(t, "Right")) return T_RIGHT;
+  if (has(t, "ซ้าย") || has(t, "left") || has(t, "Left")) return T_LEFT;
+  return T_STRAIGHT;
+}
+static void thick(int x0, int y0, int x1, int y1) {
+  for (int dx = -2; dx <= 2; dx++) for (int dy = -2; dy <= 2; dy++)
+    if (dx * dx + dy * dy <= 5) u8g2.drawLine(x0 + dx, y0 + dy, x1 + dx, y1 + dy);
+}
+static void head(int x, int y, float ang) {      // หัวลูกศร ปลายที่ (x,y) ชี้ทิศ ang (เรเดียน, 0 = ขึ้น)
+  float s = sinf(ang), c = -cosf(ang);
+  int bx = x - s * 11, by = y - c * 11;
+  u8g2.drawTriangle(x, y, bx - c * 9, by + s * 9, bx + c * 9, by - s * 9);
+}
+static void drawTurn(Turn t, int cx, int cy) {    // กล่อง ~44x44 รอบ (cx,cy)
+  const float D = 0.0174533f;
+  int bx = cx, by = cy + 20, mx = cx, my = cy + 2;
+  switch (t) {
+    case T_UTURN:
+      thick(cx + 8, cy + 20, cx + 8, cy - 4);
+      for (int a = 0; a <= 180; a += 10) u8g2.drawDisc(cx + cosf(a * D) * 8, cy - 4 - sinf(a * D) * 8, 2);
+      thick(cx - 8, cy - 4, cx - 8, cy + 8);
+      head(cx - 8, cy + 18, 180 * D);
+      break;
+    case T_ARRIVE:
+      u8g2.drawDisc(cx, cy - 6, 12); u8g2.setDrawColor(0); u8g2.drawDisc(cx, cy - 6, 5); u8g2.setDrawColor(1);
+      u8g2.drawTriangle(cx - 10, cy + 1, cx + 10, cy + 1, cx, cy + 20);
+      break;
+    default: {
+      int ang = t == T_RIGHT ? 90 : t == T_LEFT ? -90 : t == T_SRIGHT ? 45 : t == T_SLEFT ? -45 : 0;
+      if (ang == 90 || ang == -90) my = cy - 5;     // เลี้ยว: ยกจุดหักขึ้นให้อยู่กลางกล่อง
+      if (t == T_ROUND) { u8g2.drawCircle(mx, my, 8); u8g2.drawCircle(mx, my, 7); ang = 45; }
+      float a = ang * D;
+      int ex = mx + sinf(a) * 14, ey = my - cosf(a) * 14;
+      thick(bx, by, mx, my); thick(mx, my, ex, ey);
+      head(mx + sinf(a) * 22, my - cosf(a) * 22, a);
+    }
+  }
+}
+
+// ---- หาระยะทาง เช่น "350 ม." / "1.2 กม." / "500 m" ในข้อความ ----
+static bool dg(char c) { return c >= '0' && c <= '9'; }
+static bool al(char c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'); }
+static String findDistance(const String &t) {
+  int n = t.length();
+  for (int i = 0; i < n; i++) {
+    if (!dg(t[i]) || (i > 0 && (dg(t[i - 1]) || t[i - 1] == ':' || t[i - 1] == '.'))) continue;
+    int j = i;
+    while (j < n && (dg(t[j]) || t[j] == '.' || t[j] == ',')) j++;
+    int k = j;
+    while (k < n && t[k] == ' ') k++;
+    String rest = t.substring(k, k + 9);
+    int ulen = 0;
+    if (rest.startsWith("กม.")) ulen = strlen("กม.");
+    else if (rest.startsWith("กม")) ulen = strlen("กม");
+    else if (rest.startsWith("ม.")) ulen = strlen("ม.");
+    else if (rest.startsWith("เมตร")) ulen = strlen("เมตร");
+    else if (rest.startsWith("km")) ulen = 2;
+    else if (rest.startsWith("m") && (k + 1 >= n || !al(t[k + 1]))) ulen = 1;
+    if (ulen) return t.substring(i, k + ulen);
+  }
+  return "";
+}
+
+static bool iconBlank() {                          // ไอคอนแทบไม่มีจุด = ใช้ไม่ได้
+  int c = 0;
+  for (int i = 0; i < 288; i++) c += __builtin_popcount(iconXbm[i]);
+  return c < 60;
+}
+
 static void screenNav() {
   Navigation &nav = watch.getNavigation();
   refreshIcon(nav);
   String title = nav.title, dir = nav.directions;
+  String all = title + " " + dir + " " + nav.distance;
   String info = nav.duration;
   if (nav.distance.length()) { if (info.length()) info += " "; info += nav.distance; }
   if (nav.eta.length()) { if (info.length()) info += " "; info += nav.eta; }
@@ -200,22 +282,33 @@ static void screenNav() {
   const uint8_t fi = fontIdx;
   int bh = lineH(fi) + 2;                 // แถบล่าง: คำสั่ง/ชื่อถนน
   int top = 64 - bh;
-  int rx = iconOk ? 50 : 0, rw = 128 - rx;
 
-  if (iconOk) u8g2.drawXBMP(0, top >= 48 ? (top - 48) / 2 : 0, 48, 48, iconXbm);
+  // ซ้าย: ไอคอนจาก Google หรือลูกศรที่วาดเอง
+  u8g2.setClipWindow(0, 0, 47, top - 1);
+  if (iconOk && !iconBlank()) u8g2.drawXBMP(0, top >= 48 ? (top - 48) / 2 : (top - 48) / 2, 48, 48, iconXbm);
+  else drawTurn(guessTurn(all), 23, top / 2 - 2);
+  u8g2.setMaxClipWindow();
 
-  // ด้านขวา: ระยะถึงจุดเลี้ยว (title) + ข้อมูลเวลา/ระยะที่เหลือ ถ้ามีที่
-  int lh = lineH(fi);
-  if (info.length() && top >= lh + lineH(0) + 2) {
-    textBox(rx, 0, rw, lh, title.c_str(), fi, scTitle, !iconOk);
-    textBox(rx, lh + 1, rw, top - lh - 1, info.c_str(), 0, scInfo, !iconOk);
+  // ขวา: บรรทัดใหญ่ = ระยะถึงจุดเลี้ยว (ถ้าหาเจอ) ไม่งั้นใช้หัวข้อ, บรรทัดเล็ก = ข้อมูลที่เหลือ
+  String dist = findDistance(title);
+  if (!dist.length()) dist = findDistance(dir);
+  String big = dist.length() ? dist : title;
+  String small = dist.length() ? title : info;
+  if (dist.length() && title == dist) small = info;
+  if (small == big) small = "";
+  const int rx = 50, rw = 78;
+  int lh = lineH(fi), sh = lineH(0);
+  if (small.length() && top >= lh + sh) {
+    int y0 = (top - lh - sh) / 2;
+    textBox(rx, y0, rw, lh, big.c_str(), fi, scTitle, true);
+    textBox(rx, y0 + lh, rw, sh, small.c_str(), 0, scInfo, true);
   } else {
-    textBox(rx, 0, rw, top, title.c_str(), fi, scTitle, !iconOk);
+    textBox(rx, 0, rw, top, big.c_str(), fi, scTitle, true);
   }
 
   u8g2.setDrawColor(0); u8g2.drawBox(0, top, 128, bh); u8g2.setDrawColor(1);
   u8g2.drawHLine(0, top, 128);
-  textBox(0, top + 1, 128, bh - 1, dir.length() ? dir.c_str() : "กำลังนำทาง…", fi, scDir, true);
+  textBox(0, top + 1, 128, bh - 1, dir.length() ? dir.c_str() : "กำลังนำทาง…", fi, scDir, false);
 }
 
 static void screenIdle(bool chronos) {
