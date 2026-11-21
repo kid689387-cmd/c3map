@@ -1,0 +1,273 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>C3-Map Remote</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<style>
+  :root { --bg:#0f1720; --card:#1a2430; --ink:#e8eef4; --mute:#8a9bb0; --acc:#36c2ff; --ok:#3ddc84; --bad:#ff5d5d; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink); font:16px/1.45 system-ui, sans-serif; }
+  header { padding:14px 16px 6px; }
+  h1 { font-size:20px; margin:0; }
+  #msg { color:var(--mute); font-size:14px; min-height:20px; }
+  .wrap { padding:8px 12px 24px; display:grid; gap:12px; max-width:720px; margin:auto; }
+  .card { background:var(--card); border-radius:14px; padding:12px; }
+  .row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+  button { flex:1 1 auto; min-height:46px; border:0; border-radius:10px; background:#263445; color:var(--ink); font-size:16px; padding:0 14px; }
+  button.on { background:var(--acc); color:#001826; font-weight:600; }
+  button:active { transform:scale(.97); }
+  .dot { width:10px; height:10px; border-radius:50%; background:var(--bad); display:inline-block; margin-right:6px; }
+  .dot.ok { background:var(--ok); }
+  #oled { width:100%; image-rendering:pixelated; background:#000; border-radius:8px; border:6px solid #111; aspect-ratio:2/1; }
+  #map { height:300px; border-radius:10px; }
+  label { font-size:14px; color:var(--mute); }
+  input[type=range] { flex:1; }
+  .z { font-size:22px; min-width:56px; text-align:center; font-weight:600; }
+  .warn { background:#3a2a10; color:#ffd27a; padding:10px; border-radius:10px; font-size:14px; display:none; }
+</style>
+</head>
+<body>
+<header>
+  <h1>C3-Map Remote</h1>
+  <div id="msg">พร้อม</div>
+</header>
+<div class="wrap">
+  <div class="warn" id="warn"></div>
+
+  <div class="card row">
+    <button id="btnBle"><span class="dot" id="dotBle"></span>เชื่อม ESP32</button>
+    <button id="btnGps"><span class="dot" id="dotGps"></span>เริ่ม GPS</button>
+  </div>
+
+  <div class="card">
+    <label>ภาพที่จอ OLED แสดง</label>
+    <canvas id="oled" width="128" height="64"></canvas>
+  </div>
+
+  <div class="card">
+    <div class="row">
+      <button id="zOut">−</button>
+      <div class="z" id="zLbl">16</div>
+      <button id="zIn">+</button>
+    </div>
+    <div class="row" style="margin-top:8px">
+      <button id="mEdges" class="on">ลายเส้นถนน</button>
+      <button id="mDark">พื้นทึบ</button>
+      <button id="mInv">กลับสี</button>
+    </div>
+    <div class="row" style="margin-top:8px">
+      <label for="sens">ความไว</label>
+      <input type="range" id="sens" min="1" max="100" value="70">
+    </div>
+  </div>
+
+  <div class="card">
+    <label>แผนที่บนโทรศัพท์ (ตอนยังไม่เปิด GPS แตะแผนที่เพื่อย้ายตำแหน่งได้)</label>
+    <div id="map"></div>
+  </div>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+{
+  const SVC = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
+  const RX  = '6e400002-b5a3-f393-e0a9-e50e24dcca9e';
+  const W = 128, H = 64;
+  const $ = id => document.getElementById(id);
+  const msg = t => $('msg').textContent = t;
+
+  let ch = null, chunk = 180;
+  let pos = { lat: 13.7563, lon: 100.5018, speed: null };
+  let zoom = 16, mode = 'edges', inv = false, sens = 70;
+  let gpsWatch = null, wakeLock = null, busy = false, pending = false;
+
+  // ---------- ตรวจความพร้อมของเบราว์เซอร์ ----------
+  const warns = [];
+  if (!window.isSecureContext) warns.push('ต้องเปิดหน้านี้ผ่าน https:// (เช่น GitHub Pages หรือ Netlify) ไม่งั้น GPS และ Bluetooth ใช้ไม่ได้');
+  if (!navigator.bluetooth) warns.push('เบราว์เซอร์นี้ไม่รองรับ Web Bluetooth — Android ให้ใช้ Chrome, iPhone ให้ใช้แอป Bluefy');
+  if (warns.length) { $('warn').style.display = 'block'; $('warn').innerHTML = warns.join('<br>'); }
+
+  // ---------- แผนที่บนโทรศัพท์ ----------
+  const map = L.map('map').setView([pos.lat, pos.lon], zoom);
+  L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    maxZoom: 19, attribution: '&copy; OpenStreetMap contributors'
+  }).addTo(map);
+  const marker = L.circleMarker([pos.lat, pos.lon], { radius: 8, color: '#36c2ff', fillOpacity: .8 }).addTo(map);
+  map.on('click', e => {
+    if (gpsWatch !== null) return;
+    pos = { lat: e.latlng.lat, lon: e.latlng.lng, speed: null };
+    marker.setLatLng(e.latlng);
+    update();
+  });
+
+  // ---------- ดึงและแปลง tile ----------
+  const tiles = new Map();
+  function getTile(z, x, y) {
+    const n = 2 ** z;
+    if (y < 0 || y >= n) return Promise.resolve(null);
+    x = ((x % n) + n) % n;
+    const k = `${z}/${x}/${y}`;
+    if (tiles.has(k)) return tiles.get(k);
+    const p = new Promise(res => {
+      const img = new Image();
+      img.crossOrigin = 'anonymous';
+      img.onload = () => res(img);
+      img.onerror = () => res(null);
+      img.src = `https://tile.openstreetmap.org/${k}.png`;
+    });
+    tiles.set(k, p);
+    if (tiles.size > 150) tiles.delete(tiles.keys().next().value);
+    return p;
+  }
+
+  function project(lat, lon, z) {
+    const s = 256 * 2 ** z, r = lat * Math.PI / 180;
+    return [(lon + 180) / 360 * s, (1 - Math.log(Math.tan(r) + 1 / Math.cos(r)) / Math.PI) / 2 * s];
+  }
+
+  const work = document.createElement('canvas');
+  work.width = W + 2; work.height = H + 2;
+  const wctx = work.getContext('2d', { willReadFrequently: true });
+
+  async function render() {
+    const [cx, cy] = project(pos.lat, pos.lon, zoom);
+    const x0 = Math.round(cx - W / 2) - 1, y0 = Math.round(cy - H / 2) - 1;
+    wctx.fillStyle = '#fff';
+    wctx.fillRect(0, 0, W + 2, H + 2);
+    const jobs = [];
+    for (let ty = Math.floor(y0 / 256); ty <= Math.floor((y0 + H + 1) / 256); ty++)
+      for (let tx = Math.floor(x0 / 256); tx <= Math.floor((x0 + W + 1) / 256); tx++)
+        jobs.push(getTile(zoom, tx, ty).then(img => { if (img) wctx.drawImage(img, tx * 256 - x0, ty * 256 - y0); }));
+    await Promise.all(jobs);
+
+    let d;
+    try { d = wctx.getImageData(0, 0, W + 2, H + 2).data; }
+    catch (e) { msg('อ่านภาพแผนที่ไม่ได้ (CORS)'); return null; }
+
+    const S = W + 2, g = new Float32Array(S * (H + 2));
+    for (let i = 0; i < g.length; i++) g[i] = .299 * d[i * 4] + .587 * d[i * 4 + 1] + .114 * d[i * 4 + 2];
+
+    const bits = new Uint8Array(W * H);
+    const edgeT = 110 - sens, darkT = 100 + sens * 1.5;
+    for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+      const i = (y + 1) * S + (x + 1);
+      let on = mode === 'edges'
+        ? Math.abs(g[i + 1] - g[i - 1]) + Math.abs(g[i + S] - g[i - S]) > edgeT
+        : g[i] < darkT;
+      if (inv) on = !on;
+      bits[y * W + x] = on ? 1 : 0;
+    }
+    return bits;
+  }
+
+  // แพ็กเป็นรูปแบบบัฟเฟอร์ของ U8g2/SSD1306: 8 แถว page, ไบต์ละ 8 พิกเซลแนวตั้ง (LSB = บน)
+  function pack(bits) {
+    const b = new Uint8Array(1024);
+    for (let y = 0; y < H; y++) for (let x = 0; x < W; x++)
+      if (bits[y * W + x]) b[(y >> 3) * 128 + x] |= 1 << (y & 7);
+    return b;
+  }
+
+  const octx = $('oled').getContext('2d');
+  const oimg = octx.createImageData(W, H);
+  function preview(bits) {
+    for (let i = 0; i < W * H; i++) {
+      const on = bits[i];
+      oimg.data[i * 4] = on ? 120 : 0; oimg.data[i * 4 + 1] = on ? 220 : 0;
+      oimg.data[i * 4 + 2] = on ? 255 : 0; oimg.data[i * 4 + 3] = 255;
+    }
+    octx.putImageData(oimg, 0, 0);
+    octx.strokeStyle = '#fff'; octx.lineWidth = 1;
+    octx.beginPath(); octx.arc(64.5, 32.5, 5, 0, 7); octx.stroke();
+  }
+
+  function statusText() {
+    const kmh = pos.speed != null ? Math.round(pos.speed * 3.6) + 'km/h' : '';
+    return `${pos.lat.toFixed(4)},${pos.lon.toFixed(4)} ${kmh}`.slice(0, 25);
+  }
+
+  // ---------- ส่งผ่าน BLE ----------
+  async function write(pkt) { await ch.writeValueWithResponse(pkt); }
+
+  async function sendFrame(buf) {
+    for (let off = 0; off < 1024; off += chunk) {
+      const part = buf.subarray(off, Math.min(1024, off + chunk));
+      const pkt = new Uint8Array(3 + part.length);
+      pkt[0] = 1; pkt[1] = off >> 8; pkt[2] = off & 255; pkt.set(part, 3);
+      try { await write(pkt); }
+      catch (e) {
+        if (chunk > 17) { chunk = 17; off = -chunk; continue; }   // MTU เล็ก: ลดขนาดแล้วส่งใหม่ทั้งเฟรม
+        throw e;
+      }
+    }
+    await write(new Uint8Array([2, ...new TextEncoder().encode(statusText())]));
+  }
+
+  async function update() {
+    if (busy) { pending = true; return; }
+    busy = true;
+    try {
+      do {
+        pending = false;
+        const bits = await render();
+        if (!bits) break;
+        preview(bits);
+        if (ch) await sendFrame(pack(bits));
+      } while (pending);
+    } catch (e) {
+      msg('ส่งข้อมูลผิดพลาด: ' + e.message);
+    } finally { busy = false; }
+  }
+
+  // ---------- ปุ่ม ----------
+  $('btnBle').onclick = async () => {
+    if (ch) { ch.service.device.gatt.disconnect(); return; }
+    try {
+      msg('กำลังค้นหา C3-Map...');
+      const dev = await navigator.bluetooth.requestDevice({ filters: [{ namePrefix: 'C3-Map' }], optionalServices: [SVC] });
+      dev.addEventListener('gattserverdisconnected', () => {
+        ch = null; $('dotBle').classList.remove('ok'); msg('ESP32 หลุดการเชื่อมต่อ');
+      });
+      const srv = await dev.gatt.connect();
+      ch = await (await srv.getPrimaryService(SVC)).getCharacteristic(RX);
+      chunk = 180;
+      $('dotBle').classList.add('ok');
+      msg('เชื่อมกับ ' + dev.name + ' แล้ว');
+      update();
+    } catch (e) { msg('เชื่อมไม่สำเร็จ: ' + e.message); }
+  };
+
+  $('btnGps').onclick = async () => {
+    if (gpsWatch !== null) {
+      navigator.geolocation.clearWatch(gpsWatch); gpsWatch = null;
+      $('dotGps').classList.remove('ok'); msg('หยุด GPS');
+      if (wakeLock) { wakeLock.release(); wakeLock = null; }
+      return;
+    }
+    if (!navigator.geolocation) { msg('เครื่องนี้ไม่มี GPS ในเบราว์เซอร์'); return; }
+    try { wakeLock = await navigator.wakeLock?.request('screen'); } catch (e) {}
+    gpsWatch = navigator.geolocation.watchPosition(p => {
+      pos = { lat: p.coords.latitude, lon: p.coords.longitude, speed: p.coords.speed };
+      marker.setLatLng([pos.lat, pos.lon]);
+      map.setView([pos.lat, pos.lon], map.getZoom(), { animate: false });
+      $('dotGps').classList.add('ok');
+      msg(`GPS ±${Math.round(p.coords.accuracy)} m`);
+      update();
+    }, e => msg('GPS: ' + e.message), { enableHighAccuracy: true, maximumAge: 1000, timeout: 15000 });
+  };
+
+  const setZoom = z => { zoom = Math.max(3, Math.min(19, z)); $('zLbl').textContent = zoom; map.setZoom(zoom); update(); };
+  $('zIn').onclick = () => setZoom(zoom + 1);
+  $('zOut').onclick = () => setZoom(zoom - 1);
+  $('mEdges').onclick = () => { mode = 'edges'; $('mEdges').classList.add('on'); $('mDark').classList.remove('on'); update(); };
+  $('mDark').onclick = () => { mode = 'dark'; $('mDark').classList.add('on'); $('mEdges').classList.remove('on'); update(); };
+  $('mInv').onclick = () => { inv = !inv; $('mInv').classList.toggle('on', inv); update(); };
+  $('sens').oninput = e => { sens = +e.target.value; update(); };
+
+  update();
+}
+</script>
+</body>
+</html>
