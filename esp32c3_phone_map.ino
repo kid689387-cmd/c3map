@@ -17,6 +17,7 @@
     [0x02, ascii...]              = ข้อความแถบล่าง (อังกฤษ)
     [0x03, flags]                 = bit0: ESP32 วาดจุดกลางจอ
     [0x04, size]                  = ขนาดตัวอักษรไทยโหมด Google Maps: 0 เล็ก, 1 กลาง, 2 ใหญ่
+    [0x05, utf8...]               = ชื่อจุดหมาย (แสดงตอนนำทางด้วย Google Maps, ว่าง = ลบ)
 */
 #include <Arduino.h>
 #include <U8g2lib.h>
@@ -130,6 +131,8 @@ static uint8_t backBuf[1024], frontBuf[1024];
 static char statusTxt[32] = "";
 static volatile bool frameReady = false, showMarker = true, fontChanged = false;
 static volatile uint32_t lastWebMs = 0;
+static char destBuf[128] = "";
+static volatile bool destChanged = false;
 static portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
 
 class RxCB : public NimBLECharacteristicCallbacks {
@@ -163,6 +166,15 @@ class RxCB : public NimBLECharacteristicCallbacks {
     } else if (d[0] == 0x04 && n >= 2) {
       fontIdx = d[1] > 2 ? 2 : d[1];
       fontChanged = true;
+    } else if (d[0] == 0x05) {
+      size_t len = n - 1;
+      if (len > sizeof(destBuf) - 1) len = sizeof(destBuf) - 1;
+      portENTER_CRITICAL(&mux);
+      memcpy(destBuf, d + 1, len);
+      destBuf[len] = 0;
+      portEXIT_CRITICAL(&mux);
+      destChanged = true;
+      lastWebMs = 0;          // หน้าเว็บกำลังจะส่งต่อให้ Google Maps: ออกจากโหมดเว็บทันที
     }
   }
 };
@@ -193,7 +205,7 @@ static void refreshIcon(Navigation &nav) {   // แปลงไอคอน 48x4
 }
 
 // ======================= หน้าจอ =======================
-static Scroller scTitle, scDir, scInfo, scIdle;
+static Scroller scTitle, scDir, scInfo, scIdle, scDest;
 
 static void drawMarker(bool blink) {
   u8g2.setDrawColor(0); u8g2.drawDisc(64, 32, 5);
@@ -321,11 +333,33 @@ static void screenNav() {
   const int rx = 50, rw = 78;
   int lh = lineH(fi), sh = lineH(0);
   int bigY = 0, bigH = top;
-  if (small.length() && top >= lh + sh) {
-    int y0 = (top - lh - sh) / 2;
-    bigY = y0; bigH = lh;
-    textBox(rx, y0, rw, lh, big.c_str(), fi, scTitle, true);
-    textBox(rx, y0 + lh, rw, sh, small.c_str(), 0, scInfo, true);
+
+  // บรรทัดชื่อจุดหมาย (ส่งมาจากหน้าเว็บ) อยู่บนสุด
+  String dest;
+  portENTER_CRITICAL(&mux); dest = String(destBuf); portEXIT_CRITICAL(&mux);
+  String destLine = dest.length() ? String("ไป ") + dest : String("");
+  if (destLine.length() && sh + lh > top) {        // ตัวอักษรใหญ่: ที่ไม่พอ สลับแสดงกับบรรทัดใหญ่ทุก 3 วินาที
+    if ((millis() / 3000) % 2) big = destLine;
+    destLine = "";
+  }
+  if (destLine.length() && small.length() && top < sh + lh + sh) {   // ที่ไม่พอ 3 บรรทัด: รวมเวลาถึงไว้กับชื่อจุดหมาย
+    destLine += "  ";
+    destLine += small;
+    small = "";
+  }
+  int rowsH = (destLine.length() ? sh : 0) + lh + (small.length() && top >= lh + sh + (destLine.length() ? sh : 0) ? sh : 0);
+  bool showSmall = small.length() && top >= rowsH && rowsH > lh + (destLine.length() ? sh : 0);
+  int y = (top - rowsH) / 2;
+  if (y < 0) y = 0;
+  if (destLine.length()) {
+    textBox(rx, y, rw, sh, destLine.c_str(), 0, scDest, true);
+    y += sh;
+  }
+  if (destLine.length() || showSmall) {
+    bigY = y; bigH = lh;
+    textBox(rx, y, rw, lh, big.c_str(), fi, scTitle, true);
+    y += lh;
+    if (showSmall) textBox(rx, y, rw, sh, small.c_str(), 0, scInfo, true);
   } else {
     textBox(rx, 0, rw, top, big.c_str(), fi, scTitle, true);
   }
@@ -465,6 +499,7 @@ void setup() {
   prefs.begin("c3map", false);
   fontIdx = prefs.getUChar("fs", 1);
   if (fontIdx > 2) fontIdx = 1;
+  prefs.getString("dest", destBuf, sizeof(destBuf));
 
   u8g2.setBusClock(400000);
   u8g2.begin();
@@ -499,6 +534,7 @@ void loop() {
   handleButton();
 
   if (fontChanged) { fontChanged = false; prefs.putUChar("fs", fontIdx); }
+  if (destChanged) { destChanged = false; prefs.putString("dest", destBuf); }
   if (!ringing) callHidden = false;
 
   portENTER_CRITICAL(&mux);
@@ -510,6 +546,15 @@ void loop() {
   Navigation &nav = watch.getNavigation();
   bool gmaps = watch.isConnected() && (navActive || nav.active) && !webOn;
   takeNotification(gmaps || webOn);
+
+  // จบการนำทางของ Google Maps แล้ว: ลบชื่อจุดหมาย (เที่ยวหน้าค่อยตั้งใหม่)
+  static bool wasNav = false;
+  bool navNow = navActive || nav.active;
+  if (wasNav && !navNow && destBuf[0]) {
+    portENTER_CRITICAL(&mux); destBuf[0] = 0; portEXIT_CRITICAL(&mux);
+    destChanged = true;
+  }
+  wasNav = navNow;
 
   // ใกล้ถึงจุดเลี้ยว (<=100 ม.) บังคับกลับหน้านำทาง และไม่ให้ป๊อปอัปบัง
   bool nearTurn = false;
