@@ -86,6 +86,9 @@
       <button id="btnNav" class="go" disabled>เริ่มนำทาง</button>
       <button id="btnSim" disabled>จำลองการขับ</button>
     </div>
+    <div class="row">
+      <button id="btnGmaps" disabled style="background:#1a73e8;color:#fff;font-weight:700">นำทางด้วย Google Maps (ส่งชื่อจุดหมายไปที่จอ)</button>
+    </div>
   </div>
 
   <div class="card" id="nav">
@@ -382,6 +385,7 @@
     if (destMarker) destMarker.remove();
     destMarker = L.marker([lat, lon]).addTo(map);
     $('dest').textContent = 'จุดหมาย: ' + dest.name + (vias.length ? ` (แวะ ${vias.length} จุด)` : '');
+    $('btnGmaps').disabled = false;
     if (!name) {
       try {
         const r = await fetch(`https://nominatim.openstreetmap.org/reverse?format=jsonv2&zoom=18&accept-language=th&lat=${lat}&lon=${lon}`);
@@ -873,22 +877,50 @@
   setInterval(() => { if (flashArrived && Date.now() - flashArrived > 6000) { flashArrived = 0; update(); } }, 1000);
 
   // ---------------- ปุ่ม ----------------
+  async function connectBle(quiet) {
+    msg('กำลังค้นหา C3-Map…');
+    const dev = await navigator.bluetooth.requestDevice({ filters: [{ namePrefix: 'C3-Map' }], optionalServices: [SVC] });
+    dev.addEventListener('gattserverdisconnected', () => { ch = null; $('dotBle').classList.remove('ok'); if (!quiet) msg('ESP32 หลุดการเชื่อมต่อ'); });
+    const srv = await dev.gatt.connect();
+    ch = await (await srv.getPrimaryService(SVC)).getCharacteristic(RX);
+    chunk = 180;
+    await write(new Uint8Array([3, 0]));   // มือถือวาดตำแหน่งเอง
+    await write(new Uint8Array([2]));      // ล้างแถบสถานะของ ESP32
+    await sendFontSize();
+    $('dotBle').classList.add('ok');
+    msg('เชื่อมกับ ' + dev.name + ' แล้ว');
+  }
   $('btnBle').onclick = async () => {
     if (ch) { ch.service.device.gatt.disconnect(); return; }
+    try { await connectBle(false); update(); }
+    catch (e) { msg('เชื่อมไม่สำเร็จ: ' + e.message); }
+  };
+
+  // ส่งชื่อจุดหมายไปที่จอ แล้วเปิด Google Maps เริ่มนำทาง (จอจะใช้ข้อมูลจาก Chronos ต่อ)
+  function destBytes(name) {
+    const enc = new TextEncoder();
+    let n = name.trim(), b = enc.encode(n);
+    if (b.length <= 120) return b;
+    while (enc.encode(n).length > 117) n = n.slice(0, -1);
+    return enc.encode(n + '...');
+  }
+  $('btnGmaps').onclick = async () => {
+    if (!dest) return;
+    const mode = { car: 'driving', bike: 'bicycling', foot: 'walking' }[profile];
+    let url = `https://www.google.com/maps/dir/?api=1&destination=${dest.lat},${dest.lon}&travelmode=${mode}&dir_action=navigate`;
+    if (vias.length) url += '&waypoints=' + encodeURIComponent(vias.map(v => `${v.lat},${v.lon}`).join('|'));
+    if (navOn) stopNav(false);
     try {
-      msg('กำลังค้นหา C3-Map…');
-      const dev = await navigator.bluetooth.requestDevice({ filters: [{ namePrefix: 'C3-Map' }], optionalServices: [SVC] });
-      dev.addEventListener('gattserverdisconnected', () => { ch = null; $('dotBle').classList.remove('ok'); msg('ESP32 หลุดการเชื่อมต่อ'); });
-      const srv = await dev.gatt.connect();
-      ch = await (await srv.getPrimaryService(SVC)).getCharacteristic(RX);
-      chunk = 180;
-      await write(new Uint8Array([3, 0]));   // มือถือวาดตำแหน่งเอง
-      await write(new Uint8Array([2]));      // ล้างแถบสถานะของ ESP32
-      await sendFontSize();
-      $('dotBle').classList.add('ok');
-      msg('เชื่อมกับ ' + dev.name + ' แล้ว');
-      update();
-    } catch (e) { msg('เชื่อมไม่สำเร็จ: ' + e.message); }
+      if (!ch) await connectBle(true);
+      await write(new Uint8Array([5, ...destBytes(dest.name)]));
+      const dev = ch.service.device;
+      ch = null;                      // หยุดส่งภาพจากหน้าเว็บ ให้จอแสดงข้อมูลจาก Google Maps
+      dev.gatt.disconnect();
+      msg('ส่ง "' + dest.name + '" ไปที่จอแล้ว กำลังเปิด Google Maps…');
+    } catch (e) {
+      msg('ส่งชื่อจุดหมายไม่สำเร็จ (' + e.message + ') — เปิด Google Maps ต่อเลย');
+    }
+    setTimeout(() => { location.href = url; }, 300);
   };
 
   async function toggleGps() {
