@@ -765,6 +765,7 @@
       ctx.font = `${Math.max(11, Math.round(fontSize * .8))}px ${FONT}`;
       if (top - 4 > dfs + 14) ctx.fillText('เหลือ ' + fmtDist(navState.remain), 60, top - 4);
       if (showText) textBar(ctx, navState.step.text, top);
+      nearAlert(ctx, 58, 0, W - 58, top);
       return bitsFrom(ctx);
     }
 
@@ -791,12 +792,27 @@
       ctx.fillStyle = "#fff"; ctx.font = `bold 11px ${FONT}`;
       const dt = fmtDist(navState.toNext), tw = ctx.measureText(dt).width;
       ctx.fillText(dt, Math.max(1, (bw - tw) / 2), bh2 - 3);
+      nearAlert(ctx, 0, 0, bw, bh2);
     }
     if (showText) {
       const t = nav ? navState.step.text : (placeName || 'กำลังหาชื่อถนน…') + (pos.speed != null ? ` ${Math.round(pos.speed * 3.6)}กม/ชม` : '');
       textBar(ctx, t, H - barH());
     }
     return bitsFrom(ctx);
+  }
+
+  // เตือนใกล้ถึงจุดเลี้ยว: <=100 ม. กลับสีกระพริบ, <=30 ม. กรอบจอกระพริบเร็วขึ้น
+  function nearAlert(ctx, x, y, w, h) {
+    const d = navState && navState.toNext;
+    if (d == null || d > 100) return;
+    needScroll = true;                       // ให้วาดซ้ำเป็นระยะ จะได้กระพริบ
+    const ph = Math.floor(Date.now() / (d <= 30 ? 150 : 300)) % 2;
+    if (!ph) return;
+    ctx.save();
+    ctx.globalCompositeOperation = 'difference';
+    ctx.fillStyle = '#fff'; ctx.fillRect(x, y, w, h);
+    ctx.restore();
+    if (d <= 30) { ctx.strokeStyle = '#fff'; ctx.lineWidth = 2; ctx.strokeRect(1, 1, W - 2, H - 2); }
   }
 
   function bitsFrom(ctx) {
