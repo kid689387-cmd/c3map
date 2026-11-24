@@ -132,7 +132,7 @@ static char statusTxt[32] = "";
 static volatile bool frameReady = false, showMarker = true, fontChanged = false;
 static volatile uint32_t lastWebMs = 0;
 static char destBuf[128] = "";
-static volatile bool destChanged = false;
+static volatile bool destChanged = false, newDest = false;
 static portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
 
 class RxCB : public NimBLECharacteristicCallbacks {
@@ -174,6 +174,7 @@ class RxCB : public NimBLECharacteristicCallbacks {
       destBuf[len] = 0;
       portEXIT_CRITICAL(&mux);
       destChanged = true;
+      newDest = true;
       lastWebMs = 0;          // หน้าเว็บกำลังจะส่งต่อให้ Google Maps: ออกจากโหมดเว็บทันที
     }
   }
@@ -547,14 +548,18 @@ void loop() {
   bool gmaps = watch.isConnected() && (navActive || nav.active) && !webOn;
   takeNotification(gmaps || webOn);
 
-  // จบการนำทางของ Google Maps แล้ว: ลบชื่อจุดหมาย (เที่ยวหน้าค่อยตั้งใหม่)
-  static bool wasNav = false;
+  // ลบชื่อจุดหมายเมื่อจบการนำทางจริง ๆ: เคยนำทางหลังตั้งชื่อแล้ว และหยุดนำทางเกิน 90 วินาที
+  // (กันกรณี Maps ปิดการนำทางเก่าแล้วเริ่มใหม่ หรือคำนวณเส้นทางใหม่ระหว่างทาง)
+  static uint32_t lastNavMs = 0;
+  static bool navSinceDest = false;
   bool navNow = navActive || nav.active;
-  if (wasNav && !navNow && destBuf[0]) {
+  if (newDest) { newDest = false; navSinceDest = false; }
+  if (navNow) { lastNavMs = millis(); navSinceDest = true; }
+  if (navSinceDest && !navNow && destBuf[0] && millis() - lastNavMs > 90000) {
     portENTER_CRITICAL(&mux); destBuf[0] = 0; portEXIT_CRITICAL(&mux);
+    navSinceDest = false;
     destChanged = true;
   }
-  wasNav = navNow;
 
   // ใกล้ถึงจุดเลี้ยว (<=100 ม.) บังคับกลับหน้านำทาง และไม่ให้ป๊อปอัปบัง
   bool nearTurn = false;
